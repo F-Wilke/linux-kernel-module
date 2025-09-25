@@ -285,9 +285,9 @@ static char *name = "Bilbo";
 module_param(name, charp, S_IRUGO);
 MODULE_PARM_DESC(name, "The name to display in /var/log/kern.log");
 
-static int __init greeter_init(void)
+static int __init stack_alias_init(void)
 {
-    pr_info("%s: module loaded at 0x%p\n", MODULE_NAME, greeter_init);
+    pr_info("%s: module loaded at 0x%p\n", MODULE_NAME, stack_alias_init);
     pr_info("%s: greetings %s\n", MODULE_NAME, name);
 
     int ret = symbi_register_hook(&my_symbi_hook);
@@ -304,10 +304,10 @@ static int __init greeter_init(void)
     return 0;
 }
 
-static void __exit greeter_exit(void)
+static void __exit stack_alias_exit(void)
 {
     pr_info("%s: goodbye %s\n", MODULE_NAME, name);
-    pr_info("%s: module unloaded from 0x%p\n", MODULE_NAME, greeter_exit);
+    pr_info("%s: module unloaded from 0x%p\n", MODULE_NAME, stack_alias_exit);
 
     symbi_unregister_hook(&my_symbi_hook);
 	pr_info("symbi_probe: hook unregistered\n");
@@ -317,5 +317,5 @@ static void __exit greeter_exit(void)
 	pr_info("bef_rsp_set: %p\n", this_cpu_read(bef_rsp_set));
 }
 
-module_init(greeter_init);
-module_exit(greeter_exit);
+module_init(stack_alias_init);
+module_exit(stack_alias_exit);
