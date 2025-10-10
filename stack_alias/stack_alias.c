@@ -28,9 +28,6 @@ struct SymbiReg; /* your existing type */
 typedef void (*symbi_hook_t)(struct pt_regs *regs,
                              const struct SymbiReg *sreg);
 
-DEFINE_PER_CPU(unsigned long, srrar_start);
-DEFINE_PER_CPU(unsigned long, bef_ker_ds);
-DEFINE_PER_CPU(unsigned long, bef_rsp_set);
 
 /* Register/unregister the single global hook */
 int  symbi_register_hook(symbi_hook_t fn);
@@ -297,10 +294,6 @@ static int __init stack_alias_init(void)
 	}
 	pr_info("symbi_probe: hook registered\n");
 
-	pr_info("srrar_start: %p\n", this_cpu_read(srrar_start));
-	pr_info("bef_ker_ds: %p\n", this_cpu_read(bef_ker_ds));
-	pr_info("bef_rsp_set: %p\n", this_cpu_read(bef_rsp_set));
-
     return 0;
 }
 
@@ -312,9 +305,6 @@ static void __exit stack_alias_exit(void)
     symbi_unregister_hook(&my_symbi_hook);
 	pr_info("symbi_probe: hook unregistered\n");
 
-	pr_info("srrar_start: %p\n", this_cpu_read(srrar_start));
-	pr_info("bef_ker_ds: %p\n", this_cpu_read(bef_ker_ds));
-	pr_info("bef_rsp_set: %p\n", this_cpu_read(bef_rsp_set));
 }
 
 module_init(stack_alias_init);
