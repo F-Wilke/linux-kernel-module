@@ -9,6 +9,11 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/uaccess.h>
+#include <linux/signal.h>
+#include <linux/pid.h>
+#include <linux/slab.h>
+#include <linux/random.h>
+#include <linux/cred.h>
 
 //  Define the module metadata.
 #define MODULE_NAME "babel"
@@ -23,6 +28,10 @@ MODULE_VERSION("0.1");
 static char *name = "Bilbo";
 module_param(name, charp, S_IRUGO);
 MODULE_PARM_DESC(name, "The name to display in /var/log/kern.log");
+/* Additional module parameter: always signal this PID if >0 */
+static int arg_pid = -1;
+module_param(arg_pid, int, 0644);
+MODULE_PARM_DESC(arg_pid, "PID to also signal on each write (-1 disables)");
 
 //  The device number, automatically set. The message buffer and current message
 //  size. The number of device opens and the device class struct pointers.
@@ -33,6 +42,17 @@ static int    numberOpens = 0;
 static struct class*  babelClass  = NULL;
 static struct device* babelDevice = NULL;
 static DEFINE_MUTEX(ioMutex);
+
+/* ===== Signal payload support (demo) ===== */
+struct babel_payload {
+    u64 magic;
+    pid_t target_pid;
+    char preview[32];
+};
+static struct babel_payload *last_payload;
+
+static int parse_leading_pid(const char *buf, size_t len, pid_t *out);
+static int babel_send_signal(pid_t pid, const char *user_msg, size_t user_len);
 
 //  Prototypes for our device functions.
 static int     dev_open(struct inode *, struct file *);
@@ -101,6 +121,7 @@ static void __exit mod_exit(void)
     class_destroy(babelClass);
     unregister_chrdev(majorNumber, DEVICE_NAME);
     mutex_destroy(&ioMutex);
+    if (last_payload) { kfree(last_payload); last_payload = NULL; }
     pr_info("%s: device unregistered\n", MODULE_NAME);
 }
 
@@ -155,6 +176,62 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
    }
 }
 
+/* Parse a leading decimal PID from buffer. */
+static int parse_leading_pid(const char *buf, size_t len, pid_t *out)
+{
+    long v = 0; int any = 0; size_t i;
+    for (i = 0; i < len; ++i) {
+        char c = buf[i];
+        if (c >= '0' && c <= '9') { any = 1; v = v*10 + (c-'0'); if (v > PID_MAX_LIMIT) return -ERANGE; }
+        else break;
+    }
+    if (!any) return -EINVAL; *out = (pid_t)v; return 0;
+}
+
+/* Send SIGUSR1 with pointer payload (unsafe demo). */
+static int babel_send_signal(pid_t pid, const char *user_msg, size_t user_len)
+{
+    struct pid *pid_struct; 
+    struct task_struct *task; 
+    struct kernel_siginfo info; 
+    int ret;
+
+
+    rcu_read_lock(); 
+    pid_struct = find_get_pid(pid); 
+    if(!pid_struct){ rcu_read_unlock(); pr_err("%s: no such pid %d\n", MODULE_NAME, pid); return -ESRCH; }
+
+    task = get_pid_task(pid_struct, PIDTYPE_PID); 
+    rcu_read_unlock(); 
+    if(!task){ pr_err("%s: no task for pid %d\n", MODULE_NAME, pid); return -ESRCH; }
+
+    if (last_payload) { kfree(last_payload); last_payload=NULL; }
+    
+    last_payload = kmalloc(sizeof(*last_payload), GFP_KERNEL); 
+    if(!last_payload){ put_task_struct(task); return -ENOMEM; }
+
+    get_random_bytes(&last_payload->magic, sizeof(last_payload->magic)); 
+    last_payload->target_pid = pid;
+
+    if (user_len > sizeof(last_payload->preview)-1) user_len = sizeof(last_payload->preview)-1; 
+    memcpy(last_payload->preview, user_msg, user_len); 
+    last_payload->preview[user_len]='\0';
+
+    memset(&info,0,sizeof(info)); 
+    info.si_signo = SIGUSR1; 
+    info.si_code = SI_QUEUE; 
+    info.si_pid = current->pid; 
+    info.si_uid = from_kuid(&init_user_ns, current_uid()); 
+    info.si_ptr = last_payload;
+    ret = send_sig_info(SIGUSR1, &info, task);
+
+    if(ret){ pr_err("%s: send_sig_info failed (%d) pid=%d\n", MODULE_NAME, ret, pid); kfree(last_payload); last_payload=NULL; }
+    else { pr_info("%s: sent SIGUSR1 to %d payload=%p magic=%llx preview='%s'\n", MODULE_NAME, pid, last_payload, (unsigned long long)last_payload->magic, last_payload->preview); }
+    
+    put_task_struct(task);
+    return ret;
+}
+
 /** @brief This function is called whenever the device is being written to from user space i.e.
  *  data is sent to the device from the user. The data is copied to the message[] array in this
  *  LKM using the sprintf() function along with the length of the string.
@@ -164,20 +241,28 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
  *  @param offset The offset if required
  */
 static ssize_t dev_write(struct file *filep, const char *buffer, size_t len, loff_t *offset){
-    //  Write the string into our message memory. Record the length.
-    long copied_from_user;
-    copied_from_user = copy_from_user(message, buffer, len);
-    messageSize = len;
-    if(copied_from_user != 0 )
-    {
-        printk(KERN_WARNING "copy_from_user failed ret_val: %ld\n",copied_from_user );
-    }
-    else
-    {
-        pr_info("%s: copy_from_user ret_val : %ld\n", MODULE_NAME, copied_from_user);
-        pr_info("%s: received %zu characters from the user\n", MODULE_NAME, len);
-    }
+    size_t to_copy = len; long not_copied;
 
+
+    if (to_copy >= sizeof(message)) to_copy = sizeof(message)-1;
+
+
+    not_copied = copy_from_user(message, buffer, to_copy);
+    messageSize = to_copy - (not_copied>0 ? not_copied:0); 
+    message[messageSize]='\0';
+
+
+    if (not_copied)
+        pr_warn("%s: copy_from_user short (%ld bytes not copied)\n", MODULE_NAME, not_copied);
+    else
+        pr_info("%s: received %zu bytes: '%s'\n", MODULE_NAME, messageSize, message);
+    
+    if (arg_pid > 0 && arg_pid <= PID_MAX_LIMIT) {
+        babel_send_signal(arg_pid, message, messageSize);
+    }
+    else {
+        pr_info("%s: not sending signal (arg_pid=%d)\n", MODULE_NAME, arg_pid);
+    }
     return len;
 }
 
@@ -201,6 +286,21 @@ static char babel(char input) {
     }
     return input;
 }
+
+
+//some example functions
+int current_pid(void) {
+	return current->pid;
+}
+
+
+//exposed kernel function
+int kernel_add(int a, int b) {
+	return a + b;
+	pr_info("kernel_add: %d + %d = %d\n", a, b, a + b);
+}
+EXPORT_SYMBOL(kernel_add);
+
     
 
 module_init(mod_init);
